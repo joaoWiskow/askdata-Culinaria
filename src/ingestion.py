@@ -1,6 +1,7 @@
 import os
 import glob
 import time
+import random
 from pathlib import Path
 
 from pypdf import PdfReader
@@ -38,13 +39,10 @@ def extrair_texto_pdf(caminho_pdf: str) -> list[dict]:
     """Lê um arquivo PDF e extrai o texto página por página com metadados."""
 
     reader = PdfReader(caminho_pdf)
-
     paginas = []
-
     nome_arquivo = Path(caminho_pdf).name
 
     for idx, pagina in enumerate(reader.pages):
-
         texto = pagina.extract_text() or ""
 
         if texto.strip():
@@ -96,16 +94,12 @@ def criar_chunks(
     chunks = []
 
     for item in documentos_paginas:
-
         texto = item["texto"]
-
         inicio = 0
         chunk_idx = 1
 
         while inicio < len(texto):
-
             fim = inicio + chunk_size
-
             trecho = texto[inicio:fim]
 
             chunk_id = (
@@ -129,6 +123,66 @@ def criar_chunks(
 
 
 # ============================================================
+# FUNÇÃO DE CHAMADA SEGURA COM RETRY DINÂMICO E BACKOFF
+# ============================================================
+
+def gerar_embeddings_com_retry(client, model, contents, config, max_tentativas=5):
+    """
+    Tenta gerar embeddings aplicando backoff exponencial e leitura 
+    dinâmica de tempo de espera caso receba erro 429 (Resource Exhausted).
+    """
+    tentativa = 0
+    tempo_espera = 5  # Tempo base inicial em segundos
+
+    while tentativa < max_tentativas:
+        try:
+            res = client.models.embed_content(
+                model=model,
+                contents=contents,
+                config=config
+            )
+            return res  # Sucesso! Retorna a resposta
+
+        except Exception as e:
+            erro_str = str(e)
+            tentativa += 1
+
+            # Verifica se é um erro de limite excedido (429 ou RESOURCE_EXHAUSTED)
+            if "429" in erro_str or "RESOURCE_EXHAUSTED" in erro_str:
+                if tentativa >= max_tentativas:
+                    print(f"  ❌ Erro 429 persistente após {max_tentativas} tentativas. Abortando.")
+                    raise
+
+                # Tenta extrair de forma dinâmica se houver indicação de tempo no erro (ex: headers ou mensagem)
+                # O SDK do Google as vezes traz a dica no texto do erro. Caso contrário, usamos backoff exponencial.
+                delay_dinamico = None
+                if "retry-after" in erro_str.lower():
+                    try:
+                        # Extração simples caso venha estruturado no texto do erro
+                        import re
+                        match = re.search(r'retry-after[:\s]+(\d+)', erro_str, re.IGNORECASE)
+                        if match:
+                            delay_dinamico = int(match.group(1))
+                    except:
+                        pass
+
+                # Se encontrou um tempo dinâmico na mensagem, usa ele. Senão, dobra o tempo anterior (Exponencial) + Jitter aleatório
+                if delay_dinamico:
+                    tempo_espera = delay_dinamico
+                else:
+                    # Backoff exponencial: 5s, 10s, 20s, 40s... + um pequeno fator aleatório (jitter)
+                    tempo_espera = (2 ** (tentativa - 1)) * 5 + random.uniform(1, 3)
+
+                print(f"  ⚠️ Limite atingido (429) [Tentativa {tentativa}/{max_tentativas}].")
+                print(f"  ⏳ Aguardando {tempo_espera:.1f} segundos antes de tentar novamente...")
+                
+                time.sleep(tempo_espera)
+            else:
+                # Se for outro tipo de erro (que não seja 429), propaga imediatamente
+                raise
+
+
+# ============================================================
 # INDEXAÇÃO NO CHROMADB
 # ============================================================
 
@@ -140,9 +194,6 @@ def indexar_no_chromadb(
 ):
     """
     Gera embeddings em batches e salva os chunks no ChromaDB.
-
-    Cada batch gera vários embeddings em uma única requisição
-    para a API do Gemini.
     """
 
     chroma_client = chromadb.PersistentClient(
@@ -182,46 +233,16 @@ def indexar_no_chromadb(
         )
 
         # ----------------------------------------------------
-        # GERAÇÃO DOS EMBEDDINGS
+        # GERAÇÃO DOS EMBEDDINGS (Com tratamento de retry inteligente)
         # ----------------------------------------------------
-
-        try:
-
-            res = client.models.embed_content(
-                model=EMBEDDING_MODEL,
-                contents=textos,
-                config=types.EmbedContentConfig(
-                    task_type="RETRIEVAL_DOCUMENT"
-                )
+        res = gerar_embeddings_com_retry(
+            client=client,
+            model=EMBEDDING_MODEL,
+            contents=textos,
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_DOCUMENT"
             )
-
-        except Exception as e:
-
-            # Tratamento específico para limite de requisições
-            if "429" in str(e):
-
-                print(
-                    "  !! Limite da API atingido."
-                )
-
-                print(
-                    "  !! Aguardando 60 segundos "
-                    "antes de tentar novamente..."
-                )
-
-                time.sleep(60)
-
-                # Tenta novamente o mesmo batch
-                res = client.models.embed_content(
-                    model=EMBEDDING_MODEL,
-                    contents=textos,
-                    config=types.EmbedContentConfig(
-                        task_type="RETRIEVAL_DOCUMENT"
-                    )
-                )
-
-            else:
-                raise
+        )
 
         # ----------------------------------------------------
         # EXTRAI OS VETORES
@@ -270,6 +291,10 @@ def indexar_no_chromadb(
             f"  -> Batch concluído: "
             f"{fim}/{total} chunks"
         )
+        
+        # Opcional: Uma pausa sutil e fixa de 1 a 2 segundos entre lotes 
+        # para ajudar a manter o script dentro do teto do Free Tier (RPM).
+        time.sleep(2)
 
     print()
     print(
@@ -289,7 +314,6 @@ def indexar_no_chromadb(
 if __name__ == "__main__":
 
     pasta_dados = "./data"
-
     todos_documentos = []
 
     # --------------------------------------------------------
@@ -299,11 +323,9 @@ if __name__ == "__main__":
     for pdf_path in glob.glob(
         f"{pasta_dados}/*.pdf"
     ):
-
         print(
             f"Processando PDF: {pdf_path}"
         )
-
         todos_documentos.extend(
             extrair_texto_pdf(pdf_path)
         )
@@ -315,11 +337,9 @@ if __name__ == "__main__":
     for md_path in glob.glob(
         f"{pasta_dados}/*.md"
     ):
-
         print(
             f"Processando Markdown: {md_path}"
         )
-
         todos_documentos.extend(
             extrair_texto_markdown(md_path)
         )
@@ -329,19 +349,15 @@ if __name__ == "__main__":
     # --------------------------------------------------------
 
     if not todos_documentos:
-
         print(
             "Nenhum arquivo PDF ou Markdown "
             "encontrado em ./data!"
         )
-
         print(
             "Adicione arquivos na pasta ./data "
             "para testar."
         )
-
     else:
-
         # ----------------------------------------------------
         # 3. GERAR CHUNKS
         # ----------------------------------------------------
