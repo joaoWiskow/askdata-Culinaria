@@ -55,7 +55,8 @@ class RAGEngine:
     def recuperar_contexto(
         self,
         query: str,
-        top_k: int = 5
+        top_k: int = 5,
+        top_p: int = 5,
     ) -> List[Dict[str, Any]]:
         """Busca no ChromaDB os chunks mais relevantes para a pergunta."""
 
@@ -130,7 +131,7 @@ Você é o 'AskData', um assistente corporativo de inteligência
 artificial da DataLakers.
 
 Sua missão é responder à pergunta do usuário de forma clara,
-profissional e EXCLUSIVAMENTE baseada nos trechos de documentos
+profissional e baseada nos trechos de documentos
 fornecidos no contexto.
 
 REGRAS OBRIGATÓRIAS:
@@ -139,13 +140,17 @@ REGRAS OBRIGATÓRIAS:
    <contexto_recuperado>.
 
 2. Se a resposta NÃO estiver no contexto fornecido,
-   NÃO tente inventar ou utilizar conhecimentos externos.
+   então utilize conhecimentos externos e obedeça o item tres.
 
-3. Quando não houver informação suficiente no contexto,
+3. Quando não houver informação suficiente no contexto fornecido em <contexto_recuperado>,
    responda exatamente:
 
    "Desculpe, não encontrei informações sobre isso nos
-   documentos fornecidos."
+   documentos fornecidos. mas aqui esta minha tentativa: 
+   
+   [TENTATIVA]" 
+
+   com tentativa sendo a tentativa de responder a pergunta utilizando conhecimentos externos
 
 4. Ao responder, cite o nome do arquivo e a página de onde
    a informação foi extraída.
