@@ -28,12 +28,17 @@ if not api_key:
 # Modelos utilizados
 EMBEDDING_MODEL = "gemini-embedding-001"
 
-# Ordem de tentativa: principal -> alternativas (confirme os nomes na sua conta)
+# Cadeia principal de geração (principal -> alternativa)
 MODELOS_GERACAO = [
     "gemini-3.8-flash",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    "gemini-3.1-flash-lite",
 ]
+
+# Usado SOMENTE no bloco de alta demanda (última chamada ao Gemini)
+MODELO_FLASH = "gemini-3.1-flash-lite"
+
+# Quantos chunks enviar na chamada de alta demanda (contexto menor = mais leve)
+TOP_K_ALTA_DEMANDA = 3
 
 # Erros transitórios que valem a pena repetir
 CODIGOS_RETRY = {429, 500, 502, 503, 504}
@@ -55,6 +60,63 @@ def com_retry(max_tentativas: int):
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
+
+
+def _formatar_contexto(chunks: List[Dict[str, Any]]) -> str:
+    """Monta o texto de contexto com fonte/arquivo/página de cada chunk."""
+    contexto = ""
+    for idx, chunk in enumerate(chunks, 1):
+        contexto += (
+            f"\n--- [FONTE {idx} | "
+            f"Arquivo: {chunk['arquivo']} | "
+            f"Página: {chunk['pagina']}] ---\n"
+        )
+        contexto += chunk["texto"] + "\n"
+    return contexto
+
+
+def _montar_prompt(query: str, chunks: List[Dict[str, Any]]) -> str:
+    return f"""
+<contexto_recuperado>
+{_formatar_contexto(chunks)}
+</contexto_recuperado>
+
+<pergunta_do_usuario>
+{query}
+</pergunta_do_usuario>
+"""
+
+
+SYSTEM_INSTRUCTION = """
+Você é o 'AskData', um assistente corporativo de inteligência
+artificial da DataLakers.
+
+Sua missão é responder à pergunta do usuário de forma clara,
+profissional e EXCLUSIVAMENTE baseada nos trechos de documentos
+fornecidos no contexto.
+
+REGRAS OBRIGATÓRIAS:
+
+1. Responda apenas com informações presentes no
+   <contexto_recuperado>.
+
+2. Se a resposta NÃO estiver no contexto fornecido,
+   NÃO tente inventar ou utilizar conhecimentos externos.
+
+3. Quando não houver informação suficiente no contexto,
+   responda exatamente:
+
+   "Desculpe, não encontrei informações sobre isso nos
+   documentos fornecidos."
+
+4. Ao responder, cite o nome do arquivo e a página de onde
+   a informação foi extraída.
+
+5. Mantenha um tom profissional, direto e em bom português.
+
+6. Não invente informações, fontes, páginas ou documentos.
+7. Diga sempre "Olá, aluno!" antes da resposta.
+"""
 
 
 class RAGEngine:
@@ -147,8 +209,8 @@ class RAGEngine:
 
         for modelo in MODELOS_GERACAO:
 
-            @com_retry(max_tentativas=3)
-            def _chamar():
+            @com_retry(max_tentativas=4)
+            def _chamar(modelo=modelo):
                 return self.client.models.generate_content(
                     model=modelo,
                     contents=prompt,
@@ -170,7 +232,6 @@ class RAGEngine:
                     "Modelo %s falhou (%s). Tentando próximo...",
                     modelo, getattr(e, "code", "?"),
                 )
-                # 404 (modelo inexistente) e 5xx/429 -> tenta o próximo.
                 # 400/401/403 são erros de requisição/chave: não adianta trocar.
                 if getattr(e, "code", None) in (400, 401, 403):
                     raise
@@ -178,6 +239,32 @@ class RAGEngine:
         raise RuntimeError(
             f"Todos os modelos de geração falharam: {ultimo_erro}"
         )
+
+    # ------------------------------------------------------------------
+    # Chamada de ALTA DEMANDA (última chance com o Gemini)
+    # ------------------------------------------------------------------
+    @com_retry(max_tentativas=4)
+    def _resposta_alta_demanda(
+        self,
+        query: str,
+        chunks: List[Dict[str, Any]],
+    ) -> str:
+        """
+        Última chamada ao Gemini quando a cadeia principal falhou.
+        Usa modelo leve, contexto reduzido (top 3 chunks) e MANTÉM o
+        system_instruction, para preservar as regras do RAG.
+        """
+        prompt = _montar_prompt(query, chunks[:TOP_K_ALTA_DEMANDA])
+
+        response = self.client.models.generate_content(
+            model=MODELO_FLASH,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                temperature=0.1,
+            ),
+        )
+        return response.text.strip()
 
     # ------------------------------------------------------------------
     # Pipeline completo
@@ -212,80 +299,43 @@ class RAGEngine:
                 "fontes": [],
             }
 
-        # 2. Formatar o contexto
-        contexto_formatado = ""
-        for idx, chunk in enumerate(chunks, 1):
-            contexto_formatado += (
-                f"\n--- [FONTE {idx} | "
-                f"Arquivo: {chunk['arquivo']} | "
-                f"Página: {chunk['pagina']}] ---\n"
-            )
-            contexto_formatado += chunk["texto"] + "\n"
+        prompt_final = _montar_prompt(query, chunks)
 
-        # 3. Instruções do sistema
-        system_instruction = """
-Você é o 'AskData', um assistente corporativo de inteligência
-artificial da DataLakers.
-
-Sua missão é responder à pergunta do usuário de forma clara,
-profissional e EXCLUSIVAMENTE baseada nos trechos de documentos
-fornecidos no contexto.
-
-REGRAS OBRIGATÓRIAS:
-
-1. Responda apenas com informações presentes no
-   <contexto_recuperado>.
-
-2. Se a resposta NÃO estiver no contexto fornecido,
-   NÃO tente inventar ou utilizar conhecimentos externos.
-
-3. Quando não houver informação suficiente no contexto,
-   responda exatamente:
-
-   "Desculpe, não encontrei informações sobre isso nos
-   documentos fornecidos."
-
-4. Ao responder, cite o nome do arquivo e a página de onde
-   a informação foi extraída.
-
-5. Mantenha um tom profissional, direto e em bom português.
-
-6. Não invente informações, fontes, páginas ou documentos.
-7. Diga sempre "Olá, aluno!" antes da resposta.
-"""
-
-        # 4. Prompt final
-        prompt_final = f"""
-<contexto_recuperado>
-{contexto_formatado}
-</contexto_recuperado>
-
-<pergunta_do_usuario>
-{query}
-</pergunta_do_usuario>
-"""
-
-        # 5. Geração com retry + fallback; se tudo falhar, degrada com elegância
+        # 2. Geração principal (retry + fallback entre modelos)
         try:
-            texto = self._gerar_resposta(prompt_final, system_instruction)
+            texto = self._gerar_resposta(prompt_final, SYSTEM_INSTRUCTION)
             return {"resposta": texto, "fontes": chunks}
 
         except Exception as e:
-            logger.error("Geração indisponível: %s", e)
-            trechos = "\n\n".join(
-                f"[{c['arquivo']} - pág. {c['pagina']}]\n{c['texto']}"
-                for c in chunks[:3]
-            )
+            logger.error("Cadeia principal indisponível: %s", e)
+
+        # 3. ALTA DEMANDA: última chamada ao Gemini (modelo leve, contexto menor)
+        try:
+            texto = self._resposta_alta_demanda(query, chunks)
             return {
-                "resposta": (
-                    "O modelo de linguagem está com alta demanda agora, "
-                    "então não consegui redigir a resposta. Estes são os "
-                    "trechos mais relevantes encontrados nos documentos:\n\n"
-                    + trechos
-                ),
-                "fontes": chunks,
+                "resposta": texto,
+                "fontes": chunks[:TOP_K_ALTA_DEMANDA],
                 "degradado": True,
             }
+
+        except Exception as e:
+            logger.error("Chamada de alta demanda também falhou: %s", e)
+
+        # 4. Último recurso sem API: devolve os trechos recuperados
+        trechos = "\n\n".join(
+            f"[{c['arquivo']} - pág. {c['pagina']}]\n{c['texto']}"
+            for c in chunks[:TOP_K_ALTA_DEMANDA]
+        )
+        return {
+            "resposta": (
+                "O modelo de linguagem está com alta demanda agora, "
+                "então não consegui redigir a resposta. Estes são os "
+                "trechos mais relevantes encontrados nos documentos:\n\n"
+                + trechos
+            ),
+            "fontes": chunks,
+            "degradado": True,
+        }
 
 
 if __name__ == "__main__":
