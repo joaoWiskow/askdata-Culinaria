@@ -215,6 +215,12 @@ with st.sidebar:
         st.session_state.pending_prompt = None
         st.rerun()
 
+    st.markdown("---")
+    st.markdown(
+        '<a href="https://github.com/joaoWiskow/askdata-EducacaoTech" target="_blank" class="link-discreto">Repositório do grupo</a>',
+        unsafe_allow_html=True,
+    )
+
 # --- AREA PRINCIPAL ---
 st.title("AskData: Assistente de Documentação Técnica Tech")
 st.caption(
