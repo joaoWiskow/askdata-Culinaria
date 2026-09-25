@@ -147,7 +147,6 @@ REGRAS DE PRIORIDADE:
 
 9. Não invente informações, fontes, páginas ou documentos.
 
-10. Em respostas normais, comece com: "Olá, aluno!".
 """.strip()
 
 
