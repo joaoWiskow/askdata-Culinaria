@@ -1,6 +1,7 @@
 import os
 import glob
 import time
+import re
 from pathlib import Path
 
 from pypdf import PdfReader
@@ -199,18 +200,23 @@ def indexar_no_chromadb(
 
             # Tratamento específico para limite de requisições
             if "429" in str(e):
+                err_str = str(e)
+                # Tenta buscar se a mensagem da API traz um tempo de delay explícito
+                match = re.search(r'(?:retry_delay|retry_after|wait|delay|retryDelay)[^\d]*(\d+(?:\.\d+)?)', err_str, re.IGNORECASE)
+                if match:
+                    tempo_espera = int(float(match.group(1))) + 1
+                    origem_tempo = "indicado pela API"
+                else: 
+                    # Aplica Exponential Backoff: dobra o tempo a cada falha (2s, 4s, 8s, 16s, 32s...)
+                    tempo_espera = backoff_base * (2 ** min(tentativa_atual - 1, 5))
+                    origem_tempo = f"Exponential Backoff (Tentativa {tentativa_atual})"
 
-                print(
-                    "  !! Limite da API atingido."
-                )
+                print(f"  !! [429 RESOURCE_EXHAUSTED] Limite de taxa/cota excedido.")
+                print(f"  !! Aguardando {tempo_espera} segundos ({origem_tempo})...")
 
-                print(
-                    "  !! Aguardando 60 segundos "
-                    "antes de tentar novamente..."
-                )
+                time.sleep(tempo_espera)
 
-                time.sleep(60)
-
+                
                 # Tenta novamente o mesmo batch
                 res = client.models.embed_content(
                     model=EMBEDDING_MODEL,
